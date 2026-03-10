@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -17,6 +18,7 @@ from .query.query_index import query
 from .score.score import score_dataset
 from .trackstar import trackstar
 from .utils.worker_utils import validate_run_path
+from .yaml_config import expand_yaml_config
 
 
 @dataclass
@@ -153,7 +155,17 @@ class Main:
 
 
 def main(args: Optional[list[str]] = None):
-    """Parse CLI arguments and dispatch to the selected subcommand."""
+    """Parse CLI arguments and dispatch to the selected subcommand.
+
+    Supports ``--config path/to/config.yaml`` to load arguments from a YAML
+    file.  YAML keys are flattened to CLI flags (e.g. ``projection_dim: 64``
+    becomes ``--projection_dim 64``).  Explicit CLI arguments override YAML
+    values.
+    """
+    if args is None:
+        args = sys.argv[1:]
+    args = expand_yaml_config(args)
+
     parser = ArgumentParser(conflict_resolution=ConflictResolution.EXPLICIT)
     parser.add_arguments(Main, dest="prog")
     prog: Main = parser.parse_args(args=args).prog
