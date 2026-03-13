@@ -11,3 +11,12 @@ with gpt2:
 
 with gpt2 eps_root=1e-4 instead of 1e-2
 64 tok:  Spearman=0.6692  mean_ratio=inf
+
+with gpt2 disabling autocast
+64 tok:  Spearman=0.1552  mean_ratio=0.013
+
+gpt 2 with eps_root 1e-2, lds from double backwards
+64 tok:  LDS Spearman=0.8782
+128 tok:  LDS Spearman=0.9489
+256 tok:  LDS Spearman=0.8722
+512 tok:  LDS Spearman=0.9098

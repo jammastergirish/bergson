@@ -1,8 +1,3 @@
-"""
-Sweep sequence length to see how MAGIC vs Finite Difference correlation degrades.
-Tests 64, 128, 256, 512 tokens with GPT-2/WikiText.
-"""
-
 import gc
 import os
 import shutil
@@ -48,95 +43,117 @@ class ChunkedDataStream(DataStream):
         }
 
 def make_gpt2_model(device):
-    config = GPT2Config.from_pretrained("gpt2")
-    config.attn_pdrop = 0.0
-    config.embd_pdrop = 0.0
-    config.resid_pdrop = 0.0
-    model = AutoModelForCausalLM.from_pretrained("gpt2", config=config, torch_dtype=torch.float32)
-    model.set_attn_implementation("eager")
+    model = AutoModelForCausalLM.from_pretrained(
+        "gpt2", 
+        torch_dtype=torch.float32, 
+        attn_implementation="eager"
+    )
     model.loss_function = weighted_causal_lm_ce
+    # untie weights, otherwise bergson blows up
     model.lm_head.weight = torch.nn.Parameter(model.lm_head.weight.data.clone())
     model.to(device)
     return model
 
 
-def run_test(max_length, train_ds, test_ids, batch_size, device):
+def run_test(max_length, train_ds, test_ids, batch_size, device, num_subsets=20, seed=42):
     n_train = (len(train_ds) // batch_size) * batch_size
     input_ids = torch.tensor([test_ids], device=device)
 
-    print("in run test after lucia's definitely good changes")
+    # Save pretrained params/buffers for LDS retraining
+    init_model = make_gpt2_model(device)
+    init_params = {k: v.detach().clone() for k, v in init_model.named_parameters(remove_duplicate=False) if v.requires_grad}
+    init_buffers = {k: v.detach().clone() for k, v in init_model.named_buffers(remove_duplicate=False)}
+    del init_model
 
-    # Save pretrained params for Finite Difference calculations
-    model_ref = make_gpt2_model(device)
-    pp = {k: v.detach().clone() for k, v in model_ref.named_parameters(remove_duplicate=False) if v.requires_grad}
-    pb = {k: v.detach().clone() for k, v in model_ref.named_buffers(remove_duplicate=False)}
-    del model_ref
-
-    # MAGIC
+    # MAGIC forward pass
     model = make_gpt2_model(device)
-    torch.manual_seed(42)
-    opt = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
-    trainer, fwd = Trainer.initialize(model, opt)
-    ckpt = tempfile.mkdtemp()
-    stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
-    fwd = trainer.train(fwd, stream, inplace=True, save_dir=ckpt)
-    fwd.save(os.path.join(ckpt, "final_state.ckpt")).result()
+    torch.manual_seed(seed)
+    optimizer = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
+    trainer, fwd_state = Trainer.initialize(model, optimizer)
+    ckpt_dir = tempfile.mkdtemp()
 
-    stream2 = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
-    with fwd.activate(model) as params:
+    train_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
+    fwd_state = trainer.train(fwd_state, train_stream, inplace=True, save_dir=ckpt_dir)
+    fwd_state.save(os.path.join(ckpt_dir, "final_state.ckpt")).result()
+
+    # MAGIC backward pass
+    bwd_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
+    with fwd_state.activate(model) as params:
         test_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss
-        grads = grad_tree(test_loss, params, create_graph=True)
-        opt_grads = [torch.zeros_like(buf) for buf in tree_iter(fwd.opt_state) if isinstance(buf, torch.Tensor) and buf.is_floating_point()]
-        bwd = BackwardState(grads, opt_grads, torch.zeros_like(stream2.weights))
+        query_grads = grad_tree(test_loss, params, create_graph=True)
+        opt_grads = [torch.zeros_like(buf) for buf in tree_iter(fwd_state.opt_state) if isinstance(buf, torch.Tensor) and buf.is_floating_point()]
+        bwd_state = BackwardState(query_grads, opt_grads, torch.zeros_like(bwd_stream.weights))
 
-    bwd = trainer.backward(ckpt, stream2, bwd, fwd, inplace=True, cleanup=True)
-    scores = bwd.weight_grads.detach().cpu()
-    shutil.rmtree(ckpt, ignore_errors=True)
-    del model, trainer, fwd, bwd, grads, opt_grads, test_loss
+    bwd_state = trainer.backward(ckpt_dir, bwd_stream, bwd_state, fwd_state, inplace=True, cleanup=True)
+    scores = bwd_state.weight_grads.detach().cpu()
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+    del trainer, fwd_state, bwd_state, query_grads, opt_grads, test_loss
     gc.collect()
     torch.cuda.synchronize()
 
-    # Finite Difference
-    eps = 1e-2
-    fd_vals = []
-    for ex_idx in range(n_train):
-        losses = {}
-        for sign, w in [("plus", 1.0 + eps), ("minus", 1.0 - eps)]:
-            torch.manual_seed(42)
-            model_fd = make_gpt2_model(device)
-            p = {k: v.detach().clone().requires_grad_(False) for k, v in pp.items()}
-            o = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
-            t = Trainer(model_fd, o)
-            s = TrainerState(p, o.init(p), {k: v.detach().clone() for k, v in pb.items()})
-            st = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
-            st.weights.data[ex_idx] = w
-            s = t.train(s, st, inplace=True)
-            with torch.no_grad(), s.activate(model_fd):
-                l = model_fd(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss.item()
-            losses[sign] = l
-            del model_fd, t, s, st
-        fd_vals.append((losses["plus"] - losses["minus"]) / (2 * eps))
+    def make_fresh_state():
+        """Create a fresh TrainerState from saved pretrained weights."""
+        params = {k: v.detach().clone().requires_grad_(False) for k, v in init_params.items()}
+        opt = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
+        trainer = Trainer(model, opt)
+        state = TrainerState(params, opt.init(params), {k: v.detach().clone() for k, v in init_buffers.items()})
+        return trainer, state
 
-    rho = spearmanr(scores.tolist(), fd_vals).statistic
+    # Compute baseline eval loss (full training set, all weights = 1)
+    torch.manual_seed(seed)
+    baseline_trainer, baseline_state = make_fresh_state()
+    baseline_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
+    baseline_state = baseline_trainer.train(baseline_state, baseline_stream, inplace=True)
+    with torch.no_grad(), baseline_state.activate(model):
+        baseline_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss.item()
+    del baseline_trainer, baseline_state, baseline_stream
 
-    ratios = []
-    for i in range(n_train):
-        ratio = scores[i].item() / fd_vals[i] if abs(fd_vals[i]) > 1e-12 else float('inf')
-        ratios.append(ratio)
+    # LDS: leave-subset-out retraining
+    gen = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n_train, generator=gen)
+    subsets = perm.chunk(num_subsets)
 
-    mean_ratio = sum(ratios) / len(ratios)
-    print(f"  {max_length:4d} tok:  Spearman={rho:.4f}  mean_ratio={mean_ratio:.3f}  "
-          f"ratio_range=[{min(ratios):.3f}, {max(ratios):.3f}]")
+    loss_diffs = []
+    score_sums = []
+    for i, subset in enumerate(subsets):
+        torch.manual_seed(seed)
+        subset_trainer, subset_state = make_fresh_state()
+        subset_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
+        subset_stream.weights.data.fill_(1.0)
+        subset_stream.weights.data[subset] = 0.0
 
-    del pp, pb
+        for batch in subset_stream:
+            subset_state = subset_trainer.step(subset_state, batch)
+
+        with torch.no_grad(), subset_state.activate(model):
+            subset_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss.item()
+
+        loss_diffs.append(baseline_loss - subset_loss)
+        score_sums.append(scores[subset].sum().item())
+
+        running_rho = spearmanr(loss_diffs, score_sums).statistic if len(loss_diffs) > 2 else float("nan")
+        print(f"    subset {i+1}/{len(subsets)}: diff={loss_diffs[-1]:.6f}  score_sum={score_sums[-1]:.6f}  running_rho={running_rho:.4f}")
+
+        del subset_trainer, subset_state, subset_stream
+        gc.collect()
+        torch.cuda.synchronize()
+
+    rho = spearmanr(loss_diffs, score_sums).statistic
+
+    print(f"  {max_length:4d} tok:  LDS Spearman={rho:.4f}  "
+          f"n_subsets={num_subsets}  n_train={n_train}")
+
+    del model, init_params, init_buffers
     gc.collect()
     torch.cuda.synchronize()
-    return rho, mean_ratio, ratios
+    return rho, loss_diffs, score_sums
 
 
 def main():
-    device = f"cuda:0"
-    torch.cuda.set_device(0)
+    rank = 0
+
+    device = f"cuda:{rank}"
+    torch.cuda.set_device(rank)
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     raw_ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
@@ -145,7 +162,7 @@ def main():
     batch_size = 8
 
     results = {}
-    for max_length in [64]:
+    for max_length in [64, 128, 256, 512]:
         ds = chunk_and_tokenize(raw_ds, tokenizer, max_seq_len=max_length)
         tokens = ds["input_ids"][:]
         ds = ds.select(range(n_train))
@@ -153,14 +170,20 @@ def main():
         train_ds = ds.select(range(len(ds) - 1))
         test_ids = tokens[n_train - 1].tolist()
 
-        rho, mean_ratio, ratios = run_test(max_length, train_ds, test_ids, batch_size, device)
-        results[max_length] = (rho, mean_ratio)
+        rho, diffs, score_sums = run_test(
+            max_length, 
+            train_ds, 
+            test_ids, 
+            batch_size, 
+            device
+        )
+        results[max_length] = rho
 
     print(f"\n{'='*60}")
     print("Summary")
     print(f"{'='*60}")
-    for ml, (rho, mr) in results.items():
-        print(f"  {ml:4d} tok:  Spearman={rho:.4f}  mean_ratio={mr:.3f}")
+    for ml, rho in results.items():
+        print(f"  {ml:4d} tok:  LDS Spearman={rho:.4f}")
 
 
 if __name__ == "__main__":
