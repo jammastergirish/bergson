@@ -20,3 +20,15 @@ gpt 2 with eps_root 1e-2, lds from double backwards
 128 tok:  LDS Spearman=0.9489
 256 tok:  LDS Spearman=0.8722
 512 tok:  LDS Spearman=0.9098
+
+above, but with truncate and pad, instead of chunk and tokenize
+64 tok:  LDS Spearman=0.7293
+128 tok:  LDS Spearman=0.8571
+256 tok:  LDS Spearman=-0.2812
+512 tok:  LDS Spearman=0.8391
+
+above, but with truncate and pad, but first filtering out empty sequences
+64 tok:  LDS Spearman=0.7820
+128 tok:  LDS Spearman=0.8361
+256 tok:  LDS Spearman=0.6647
+512 tok:  LDS Spearman=0.8842

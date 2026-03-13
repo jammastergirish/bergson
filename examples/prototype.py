@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, GPT2LMHeadModel, GPT2Config
 from bergson.distributed import grad_tree
 from bergson.trainer import BackwardState, DataStream, Trainer, TrainerState
 from bergson.utils.math import weighted_causal_lm_ce
-from bergson.chunk_and_tokenize import chunk_and_tokenize
+from bergson.chunk_and_tokenize import chunk_and_tokenize, tokenize_and_pad
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -163,9 +163,16 @@ def main():
 
     results = {}
     for max_length in [64, 128, 256, 512]:
-        ds = chunk_and_tokenize(raw_ds, tokenizer, max_seq_len=max_length)
+        raw_ds = raw_ds.filter(lambda x: len(x["text"].strip()) > 0)
+        ds = tokenize_and_pad(raw_ds, tokenizer, max_seq_len=max_length)
         tokens = ds["input_ids"][:]
         ds = ds.select(range(n_train))
+
+        for i in range(20):
+            ids = ds[i]["input_ids"]
+            print(f"Row {i}: {len(ids)} tokens")
+            print(tokenizer.decode(ids))
+            print("-"*100)
 
         train_ds = ds.select(range(len(ds) - 1))
         test_ids = tokens[n_train - 1].tolist()

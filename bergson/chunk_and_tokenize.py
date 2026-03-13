@@ -12,6 +12,22 @@ from transformers import PreTrainedTokenizerBase
 
 T = TypeVar("T", bound=Union[Dataset, DatasetDict])
 
+def tokenize_and_pad(raw_ds, tokenizer, max_seq_len):
+    tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token by default
+
+    def tokenize_fn(examples):
+        return tokenizer(
+            examples["text"],
+            max_length=max_seq_len,
+            truncation=True,
+            padding="max_length",
+            return_tensors=None,  # keep as lists for HF datasets
+        )
+
+    ds = raw_ds.map(tokenize_fn, batched=True, remove_columns=raw_ds.column_names)
+    ds.set_format("torch")
+    return ds
+
 
 def chunk_and_tokenize(
     data: T,
