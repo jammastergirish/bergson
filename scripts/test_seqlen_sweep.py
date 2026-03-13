@@ -1,5 +1,5 @@
 """
-Sweep sequence length to see how MAGIC vs FD correlation degrades.
+Sweep sequence length to see how MAGIC vs Finite Difference correlation degrades.
 Tests 64, 128, 256, 512 tokens with GPT-2/WikiText.
 """
 
@@ -62,7 +62,7 @@ def run_test(max_length, train_ds, test_ids, batch_size, device):
     n_train = len(train_ds)
     input_ids = torch.tensor([test_ids], device=device)
 
-    # Save pretrained params for FD
+    # Save pretrained params for Finite Difference calculations
     model_ref = make_model(device)
     pp = {k: v.detach().clone() for k, v in model_ref.named_parameters(remove_duplicate=False) if v.requires_grad}
     pb = {k: v.detach().clone() for k, v in model_ref.named_buffers(remove_duplicate=False)}
@@ -92,7 +92,7 @@ def run_test(max_length, train_ds, test_ids, batch_size, device):
     gc.collect()
     torch.cuda.synchronize()
 
-    # FD
+    # Finite Difference
     eps = 1e-2
     fd_vals = []
     for ex_idx in range(n_train):
