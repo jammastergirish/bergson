@@ -47,23 +47,11 @@ class ChunkedDataStream(DataStream):
             ],
         }
 
-
-def make_pythia_model(device):
-    model_name = "EleutherAI/pythia-70m"
-    # tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        attn_implementation="eager"
-    )
-    model.loss_function = weighted_causal_lm_ce
-    model.to(device)
-    return model
-
 def make_gpt2_model(device):
-    # config = GPT2Config.from_pretrained("gpt2")
-    # config.attn_pdrop = 0.0
-    # config.embd_pdrop = 0.0
-    # config.resid_pdrop = 0.0
+    config = GPT2Config.from_pretrained("gpt2")
+    config.attn_pdrop = 0.0
+    config.embd_pdrop = 0.0
+    config.resid_pdrop = 0.0
     model = AutoModelForCausalLM.from_pretrained("gpt2", config=config, torch_dtype=torch.float32)
     model.set_attn_implementation("eager")
     model.loss_function = weighted_causal_lm_ce
@@ -79,13 +67,13 @@ def run_test(max_length, train_ds, test_ids, batch_size, device):
     print("in run test after lucia's definitely good changes")
 
     # Save pretrained params for Finite Difference calculations
-    model_ref = make_pythia_model(device)
+    model_ref = make_gpt2_model(device)
     pp = {k: v.detach().clone() for k, v in model_ref.named_parameters(remove_duplicate=False) if v.requires_grad}
     pb = {k: v.detach().clone() for k, v in model_ref.named_buffers(remove_duplicate=False)}
     del model_ref
 
     # MAGIC
-    model = make_pythia_model(device)
+    model = make_gpt2_model(device)
     torch.manual_seed(42)
     opt = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
     trainer, fwd = Trainer.initialize(model, opt)
@@ -115,7 +103,7 @@ def run_test(max_length, train_ds, test_ids, batch_size, device):
         losses = {}
         for sign, w in [("plus", 1.0 + eps), ("minus", 1.0 - eps)]:
             torch.manual_seed(42)
-            model_fd = make_pythia_model(device)
+            model_fd = make_gpt2_model(device)
             p = {k: v.detach().clone().requires_grad_(False) for k, v in pp.items()}
             o = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
             t = Trainer(model_fd, o)
@@ -150,11 +138,7 @@ def main():
     device = f"cuda:0"
     torch.cuda.set_device(0)
 
-    # model = "gpt2"
-    model = "EleutherAI/pythia-70m"
-    print(model)
-
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     raw_ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
 
     n_train = 100
