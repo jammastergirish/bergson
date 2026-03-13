@@ -48,7 +48,7 @@ class RunConfig:
     max_length: int = 256
     """Maximum token sequence length."""
 
-    save_dir: str = "/mnt/ssd-3/nora/magic-ckpts"
+    save_dir: str = "/mnt/ssd-1/will-magic/magic-ckpts"
     """Directory to save forward pass checkpoints."""
 
     num_subsets: int = 100
