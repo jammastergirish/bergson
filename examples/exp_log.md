@@ -10,7 +10,13 @@ with gpt2:
 512 tok:  Spearman=0.8855  mean_ratio=inf
 
 with gpt2 eps_root=1e-4 instead of 1e-2
-64 tok:  Spearman=0.6692  mean_ratio=inf
+64 tok:  LDS Spearman=0.5669
+
+with gpt2 eps_root=1e-8
+64 tok:  LDS Spearman=0.4707
+
+with gpt2 eps_root=1e-1
+64 tok:  LDS Spearman=0.8977
 
 with gpt2 disabling autocast
 64 tok:  Spearman=0.1552  mean_ratio=0.013
@@ -32,3 +38,16 @@ above, but with truncate and pad, but first filtering out empty sequences
 128 tok:  LDS Spearman=0.8361
 256 tok:  LDS Spearman=0.6647
 512 tok:  LDS Spearman=0.8842
+
+200 seqs, 1e-2
+64 tok:  LDS Spearman=0.9579
+
+with lr schedule from the paper, 1e-2
+512 tok:  LDS Spearman=-0.1624
+
+with lr schedule from double backwards, 1e-2
+512 tok:  LDS Spearman=0.8612
+
+without weight decay
+
+512 tok:  LDS Spearman=0.9338

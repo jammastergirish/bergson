@@ -44,8 +44,8 @@ class ChunkedDataStream(DataStream):
 
 def make_gpt2_model(device):
     model = AutoModelForCausalLM.from_pretrained(
-        "gpt2", 
-        torch_dtype=torch.float32, 
+        "gpt2",
+        torch_dtype=torch.float32,
         attn_implementation="eager"
     )
     model.loss_function = weighted_causal_lm_ce
@@ -68,7 +68,7 @@ def run_test(max_length, train_ds, test_ids, batch_size, device, num_subsets=20,
     # MAGIC forward pass
     model = make_gpt2_model(device)
     torch.manual_seed(seed)
-    optimizer = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
+    optimizer = torchopt.adamw(1e-5, betas=(0.95, 0.975), eps_root=1e-2)
     trainer, fwd_state = Trainer.initialize(model, optimizer)
     ckpt_dir = tempfile.mkdtemp()
 
@@ -80,12 +80,18 @@ def run_test(max_length, train_ds, test_ids, batch_size, device, num_subsets=20,
     bwd_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
     with fwd_state.activate(model) as params:
         test_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss
-        query_grads = grad_tree(test_loss, params, create_graph=True)
+        query_grads = grad_tree(test_loss, params)
+        query_grads = {k: g.detach().clone() for k, g in query_grads.items()}
         opt_grads = [torch.zeros_like(buf) for buf in tree_iter(fwd_state.opt_state) if isinstance(buf, torch.Tensor) and buf.is_floating_point()]
         bwd_state = BackwardState(query_grads, opt_grads, torch.zeros_like(bwd_stream.weights))
 
     bwd_state = trainer.backward(ckpt_dir, bwd_stream, bwd_state, fwd_state, inplace=True, cleanup=True)
     scores = bwd_state.weight_grads.detach().cpu()
+
+    # Baseline: eval loss from the fully-trained forward pass
+    with torch.no_grad(), fwd_state.activate(model):
+        baseline_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss.item()
+
     shutil.rmtree(ckpt_dir, ignore_errors=True)
     del trainer, fwd_state, bwd_state, query_grads, opt_grads, test_loss
     gc.collect()
@@ -94,19 +100,10 @@ def run_test(max_length, train_ds, test_ids, batch_size, device, num_subsets=20,
     def make_fresh_state():
         """Create a fresh TrainerState from saved pretrained weights."""
         params = {k: v.detach().clone().requires_grad_(False) for k, v in init_params.items()}
-        opt = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2, weight_decay=1e-5)
+        opt = torchopt.adamw(1e-5, betas=(0.95, 0.975), eps_root=1e-2)
         trainer = Trainer(model, opt)
         state = TrainerState(params, opt.init(params), {k: v.detach().clone() for k, v in init_buffers.items()})
         return trainer, state
-
-    # Compute baseline eval loss (full training set, all weights = 1)
-    torch.manual_seed(seed)
-    baseline_trainer, baseline_state = make_fresh_state()
-    baseline_stream = ChunkedDataStream(train_ds, processor=None, batch_size=batch_size, device=device, max_length=max_length)
-    baseline_state = baseline_trainer.train(baseline_state, baseline_stream, inplace=True)
-    with torch.no_grad(), baseline_state.activate(model):
-        baseline_loss = model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), labels=input_ids.clone()).loss.item()
-    del baseline_trainer, baseline_state, baseline_stream
 
     # LDS: leave-subset-out retraining
     gen = torch.Generator().manual_seed(seed)
@@ -162,17 +159,11 @@ def main():
     batch_size = 8
 
     results = {}
-    for max_length in [64, 128, 256, 512]:
+    for max_length in [512]:
         raw_ds = raw_ds.filter(lambda x: len(x["text"].strip()) > 0)
-        ds = tokenize_and_pad(raw_ds, tokenizer, max_seq_len=max_length)
+        ds = chunk_and_tokenize(raw_ds, tokenizer, max_seq_len=max_length)
         tokens = ds["input_ids"][:]
         ds = ds.select(range(n_train))
-
-        for i in range(20):
-            ids = ds[i]["input_ids"]
-            print(f"Row {i}: {len(ids)} tokens")
-            print(tokenizer.decode(ids))
-            print("-"*100)
 
         train_ds = ds.select(range(len(ds) - 1))
         test_ids = tokens[n_train - 1].tolist()
