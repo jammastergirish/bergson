@@ -331,7 +331,24 @@ class Trainer:
         updates, new_state = self.optimizer.update(
             grads, state.opt_state, inplace=inplace, params=state.params
         )
-        new_params = torchopt.apply_updates(state.params, updates, inplace=inplace)
+
+        # Deduplicate tied weights before apply_updates to avoid double updates.
+        # With inplace=True, apply_updates calls tensor.add_(update) for each key;
+        # tied weights (same tensor for multiple keys) get updated multiple times.
+        seen: dict[int, str] = {}
+        unique_params: dict[str, torch.Tensor] = {}
+        unique_updates: dict[str, torch.Tensor] = {}
+        for key in state.params:
+            tid = id(state.params[key])
+            if tid not in seen:
+                seen[tid] = key
+                unique_params[key] = state.params[key]
+                unique_updates[key] = updates[key]
+
+        applied = torchopt.apply_updates(unique_params, unique_updates, inplace=inplace)
+
+        # Rebuild with tying preserved
+        new_params = {key: applied[seen[id(state.params[key])]] for key in state.params}
         state = TrainerState(
             new_params,
             new_state,
