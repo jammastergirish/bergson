@@ -309,7 +309,12 @@ class Trainer:
 
         # Trainable params live on the meta device and are swapped in from state.
         # Frozen params remain on-device in the model and are left untouched.
-        with swap_parameters(self.model, state.params, state.buffers) as params:
+        # When trace=True, preserve_graph=True avoids wrapping tensors in
+        # nn.Parameter (which creates new leaf nodes) so the autograd graph
+        # connects the loss back to state.params through the Hessian.
+        with swap_parameters(
+            self.model, state.params, state.buffers, preserve_graph=trace
+        ) as params:
             outputs = self.model(**inputs)
 
             # Currently we support two output types: HuggingFace, and "raw loss"
