@@ -3,45 +3,29 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import torchopt
-from datasets import Dataset
-from transformers import AutoTokenizer
 
 from bergson.magic.data_stream import DataStream
 from bergson.magic.trainer import Trainer
 from bergson.utils.logging import wandb_log_fn
 
 
-@pytest.fixture
-def tiny_dataset():
-    return Dataset.from_dict({"text": [f"hello world {i}" for i in range(8)]})
-
-
-@pytest.fixture
-def tokenizer():
-    return AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Phi3ForCausalLM")
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_log_fn_called_each_step(model, tiny_dataset, tokenizer):
+def test_log_fn_called_each_step(model, dataset):
     """log_fn is called once per training step with (step_idx, loss)."""
     model = model.to("cuda:0")
     opt = torchopt.adamw(1e-4)
     trainer, state = Trainer.initialize(model, opt)
 
-    num_steps = 4
     stream = DataStream(
-        tiny_dataset,
-        tokenizer,
-        batch_size=2,
-        num_batches=num_steps,
+        dataset,
+        batch_size=len(dataset),
         device="cuda:0",
-        max_length=16,
     )
 
     log = MagicMock()
     trainer.train(state, stream, inplace=True, log_fn=log)
 
-    assert log.call_count == num_steps
+    assert log.call_count == len(stream)
     for i, call in enumerate(log.call_args_list):
         step, loss = call.args
         assert step == i
