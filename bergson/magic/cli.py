@@ -263,6 +263,8 @@ def worker(
 
     if run_cfg.num_epochs > 1:
         train_dataset = train_dataset.repeat(run_cfg.num_epochs)
+        if "doc_ids" not in train_dataset.column_names:
+            num_train_docs = len(train_dataset)
 
     # Ensure total effective batch size is divisible by world size
     assert run_cfg.batch_size % world_size == 0
