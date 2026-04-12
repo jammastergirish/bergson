@@ -13,7 +13,8 @@ class DataStream:
         *,
         device: torch.device | str = "cpu",
         input_key: str = "text",
-        weight_shape: tuple[int, ...] | None = None,
+        per_token_seq_len: int | None = None,
+        pad_count: int = 0,
     ):
         self.batch_size = batch_size
         self.dataset = dataset
@@ -21,14 +22,35 @@ class DataStream:
         self.input_key = input_key
         self.n = len(dataset)
         self.num_batches = self.n // batch_size
+        self.pad_count = pad_count
+        self.has_doc_ids = "doc_ids" in dataset.column_names
 
-        # If a shape isn't provided, assume that each sequence contains one document
-        if weight_shape is None:
-            weight_shape = (self.n,)
+        # Compute weight shape from the dataset
+        if per_token_seq_len is not None:
+            w_shape = (self.n, per_token_seq_len)
+        elif self.has_doc_ids:
+            # One weight per unique document
+            num_docs = max(doc_id for ids in dataset["doc_ids"] for doc_id in ids) + 1
+            w_shape = (num_docs,)
+        else:
+            # One weight per row
+            w_shape = (self.n,)
 
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.weights = torch.nn.Parameter(torch.ones(*weight_shape, device=device))
+        self.weights = torch.nn.Parameter(torch.ones(*w_shape, device=device))
+
+        # Zero out pad entries. Only meaningful when weights are indexed by row
+        # position (no doc_ids). With doc_ids, pad rows just reference existing
+        # documents and don't need special treatment.
+        if pad_count and not self.has_doc_ids:
+            self.weights.data[-pad_count:] = 0.0
+
+    def reset_weights(self):
+        """Reset all weights to 1.0, then re-zero pad entries."""
+        self.weights.fill_(1.0)
+        if self.pad_count and not self.has_doc_ids:
+            self.weights.data[-self.pad_count :] = 0.0
 
     @property
     def requires_grad(self) -> bool:

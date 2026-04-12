@@ -207,34 +207,28 @@ def prepare_trainer(
 def pad_dataset_to_batch_size(
     dataset: Dataset,
     batch_size: int,
-    num_docs: int,
     label: str,
     global_rank: int,
-) -> tuple[Dataset, int, int]:
+) -> tuple[Dataset, int]:
     """Pad dataset to be divisible by batch_size by repeating the last example.
 
-    Returns (padded_dataset, num_docs, pad_count). num_docs is updated only when
-    the dataset has no "doc_ids" column (i.e. each row is its own document).
-    pad_count is 0 if no padding was needed.
+    Returns (padded_dataset, pad_count). pad_count is 0 if no padding was needed.
     """
     remainder = len(dataset) % batch_size
     if not remainder:
-        return dataset, num_docs, 0
+        return dataset, 0
 
     pad_count = batch_size - remainder
     total = len(dataset)
     pad_indices = list(range(total)) + [total - 1] * pad_count
     dataset = dataset.select(pad_indices)
 
-    # Update the number of documents to include the padded examples
-    if "doc_ids" not in dataset.column_names:
-        num_docs = len(dataset)
     if global_rank == 0:
         print(
             f"{label}: padded {pad_count}/{total} examples "
             f"(weight=0) to fill last batch"
         )
-    return dataset, num_docs, pad_count
+    return dataset, pad_count
 
 
 def worker(
@@ -243,8 +237,6 @@ def worker(
     world_size: int,
     train_dataset: Dataset,
     query_dataset: Dataset,
-    num_train_docs: int,
-    num_query_docs: int,
     run_cfg: MagicConfig,
 ):
     torch.cuda.set_device(rank)
@@ -268,29 +260,28 @@ def worker(
     assert run_cfg.batch_size % world_size == 0
 
     # Pad train dataset to be divisible by batch_size (weight=0 for padding)
-    train_dataset, num_train_docs, pad_count = pad_dataset_to_batch_size(
-        train_dataset, run_cfg.batch_size, num_train_docs, "Train", global_rank
+    train_dataset, pad_count = pad_dataset_to_batch_size(
+        train_dataset, run_cfg.batch_size, "Train", global_rank
     )
 
+    per_token_seq_len = None
     if run_cfg.per_token:
-        seq_len = run_cfg.data.chunk_length
-        if seq_len <= 0:
-            seq_len = max(train_dataset["length"])
-            print(f"Using max sequence length {seq_len} for per-token attribution")
-
-        w_shape = (len(train_dataset), seq_len)
-    else:
-        w_shape = (num_train_docs,)
+        per_token_seq_len = run_cfg.data.chunk_length
+        if per_token_seq_len <= 0:
+            per_token_seq_len = max(train_dataset["length"])
+            print(
+                f"Using max sequence length {per_token_seq_len}"
+                " for per-token attribution"
+            )
 
     stream = DataStream(
         train_dataset,
         run_cfg.batch_size,
         device=f"cuda:{rank}",
         input_key=run_cfg.data.prompt_column,
-        weight_shape=w_shape,
+        per_token_seq_len=per_token_seq_len,
+        pad_count=pad_count,
     )
-    if pad_count:
-        stream.weights.data[-pad_count:] = 0.0
 
     log_fn = None
     if run_cfg.wandb_project and global_rank == 0:
@@ -328,8 +319,8 @@ def worker(
         save_fut.result()  # ensure state0 is saved before validation loads it
 
     # Pad query dataset to be divisible by batch_size (weight=0 for padding)
-    query_dataset, num_query_docs, query_pad_count = pad_dataset_to_batch_size(
-        query_dataset, run_cfg.batch_size, num_query_docs, "Query", global_rank
+    query_dataset, query_pad_count = pad_dataset_to_batch_size(
+        query_dataset, run_cfg.batch_size, "Query", global_rank
     )
     if len(query_dataset) < run_cfg.batch_size:
         raise ValueError(
@@ -344,10 +335,8 @@ def worker(
         run_cfg.batch_size,
         device=f"cuda:{rank}",
         input_key=run_cfg.query.prompt_column,
-        weight_shape=(num_query_docs,),
+        pad_count=query_pad_count,
     )
-    if query_pad_count:
-        query_stream.weights.data[-query_pad_count:] = 0.0
 
     query_grads, baseline = compute_query_gradients(
         fwd_state, model, query_stream, run_cfg.query_method, run_cfg.fsdp
@@ -376,7 +365,7 @@ def worker(
         dist.all_reduce(bwd_state.weight_grads, op=dist.ReduceOp.SUM)
 
     scores = bwd_state.weight_grads.cpu()
-    if pad_count:
+    if pad_count and not stream.has_doc_ids:
         scores = scores[:-pad_count]
     if global_rank == 0:
         print(f"Baseline loss: {baseline}")
@@ -395,7 +384,7 @@ def worker(
     score_sums = []
 
     gen = torch.Generator().manual_seed(run_cfg.seed)
-    num_real = len(stream.weights) - pad_count
+    num_real = len(stream.weights) - (pad_count if not stream.has_doc_ids else 0)
     perm = torch.randperm(num_real, generator=gen)
     subsets = perm.chunk(run_cfg.num_subsets)
 
@@ -411,9 +400,7 @@ def worker(
         fwd_state.load(path0)
         fwd_state.detach_()
 
-        stream.weights.fill_(1.0)
-        if pad_count:
-            stream.weights.data[-pad_count:] = 0.0
+        stream.reset_weights()
         stream.weights[subset] = 0.0
 
         for x in stream:
@@ -494,12 +481,12 @@ def run_magic(run_cfg: MagicConfig):
         while not barrier.exists():
             time.sleep(0.5)
 
-    train_ds, train_n = setup_data_pipeline(run_cfg)
+    train_ds, _ = setup_data_pipeline(run_cfg)
 
     # Shuffle the train_ds with the seed.
     train_ds = train_ds.shuffle(seed=run_cfg.seed)
 
-    query_ds, query_n = setup_data_pipeline(run_cfg, run_cfg.query)
+    query_ds, _ = setup_data_pipeline(run_cfg, run_cfg.query)
 
     if barrier is not None and is_main_node:
         barrier.touch()
@@ -507,7 +494,7 @@ def run_magic(run_cfg: MagicConfig):
     launch_distributed_run(
         "run_magic",
         worker,
-        [train_ds, query_ds, train_n, query_n, run_cfg],
+        [train_ds, query_ds, run_cfg],
         run_cfg.distributed,
     )
 
