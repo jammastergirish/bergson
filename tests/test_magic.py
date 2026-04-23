@@ -172,9 +172,9 @@ def test_magic_per_token_scores_zero_at_masked_labels(model_name):
         f"Expected zero MAGIC scores at masked/unused positions; "
         f"got max |score| = {per_tok[zero_mask].abs().max():.3e}"
     )
-    assert per_tok[~zero_mask].abs().sum() > 0, (
-        "All non-masked positions are zero — test is degenerate"
-    )
+    assert (
+        per_tok[~zero_mask].abs().sum() > 0
+    ), "All non-masked positions are zero — test is degenerate"
 
 
 @pytest.mark.parametrize("model_name", MODEL_CONFIGS)
@@ -237,9 +237,7 @@ def test_magic_per_token_sums_to_per_doc_packed(model_name):
 
     # Every doc should receive at least one nonzero token contribution.
     assert (agg.abs() > 0).all(), f"Some doc has zero aggregated score: {agg}"
-    torch.testing.assert_close(
-        agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4
-    )
+    torch.testing.assert_close(agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4)
 
 
 def test_magic_resume(dataset):
