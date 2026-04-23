@@ -85,6 +85,86 @@ def test_magic_two_steps(model_name, dataset):
     assert scores.abs().sum() > 0, "Attribution scores are all zero"
 
 
+def _run_magic(model_name, dataset, weight_shape, seed=42, device="cpu"):
+    """Run a 1-step MAGIC cycle and return the weight_grads (MAGIC scores)."""
+    torch.manual_seed(seed)
+    config = AutoConfig.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_config(
+        config, torch_dtype=torch.float32, attn_implementation="eager"
+    )
+    model.loss_function = weighted_causal_lm_ce
+    model.requires_grad_(True)
+
+    optimizer = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2)
+    trainer, fwd_state = Trainer.initialize(model, optimizer)
+
+    train_stream = DataStream(
+        dataset,
+        batch_size=len(dataset),
+        device=device,
+        weight_shape=weight_shape,
+    )
+
+    with tempfile.TemporaryDirectory() as ckpt_dir:
+        fwd_state = trainer.train(
+            fwd_state, train_stream, inplace=True, save_dir=ckpt_dir
+        )
+
+        with fwd_state.activate(model) as params:
+            batch = train_stream[0]
+            del batch["example_weight"]
+            loss = model(**batch).loss
+            query_grads = {
+                k: g.detach().clone() for k, g in grad_tree(loss, params).items()
+            }
+            opt_grads = [
+                torch.zeros_like(buf)
+                for buf in tree_iter(fwd_state.opt_state)
+                if isinstance(buf, torch.Tensor) and buf.is_floating_point()
+            ]
+            bwd_state = BackwardState(
+                query_grads, opt_grads, torch.zeros_like(train_stream.weights)
+            )
+
+        train_stream.requires_grad = True
+        bwd_state = trainer.backward(
+            ckpt_dir,
+            train_stream,
+            bwd_state,
+            fwd_state,
+            inplace=True,
+            cleanup=True,
+        )
+
+    return bwd_state.weight_grads.detach().cpu()
+
+
+@pytest.mark.parametrize("model_name", MODEL_CONFIGS)
+def test_magic_per_token_sums_to_per_doc(model_name, dataset):
+    """Per-token MAGIC scores summed over tokens equal per-doc MAGIC scores.
+
+    MAGIC computes d(query_loss)/dw through the training trajectory. With
+    weighted_causal_lm_ce, the training loss is
+        per-doc:   sum_{i,t} w_i     * tok_loss[i,t] / denom
+        per-token: sum_{i,t} w_{i,t} * tok_loss[i,t] / denom
+    Both evaluate to the same value at initialization (all weights = 1), so the
+    two runs share an identical training trajectory. By linearity of the MAGIC
+    backward pass, dQ/dw_i = sum_t dQ/dw_{i,t}.
+    """
+    N = len(dataset)
+    T = len(dataset[0]["input_ids"])
+
+    per_doc = _run_magic(model_name, dataset, weight_shape=(N,))
+    per_tok = _run_magic(model_name, dataset, weight_shape=(N, T))
+
+    assert per_doc.shape == (N,)
+    assert per_tok.shape == (N, T)
+
+    torch.testing.assert_close(
+        per_tok.sum(dim=-1), per_doc, atol=1e-5, rtol=1e-4
+    )
+
+
 def test_magic_resume(dataset):
     """Resume from a checkpoint mid-training and verify identical final state."""
     device = "cpu"
