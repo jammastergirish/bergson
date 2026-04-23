@@ -695,7 +695,9 @@ def test_token_scores_sum_equals_sequence_score(
         )
 
     # Per-doc scores: sum_m <query_m, seq_grad_m[i]>
-    seq_scores = torch.zeros(len(dataset), device=next(iter(query_grads.values())).device)
+    seq_scores = torch.zeros(
+        len(dataset), device=next(iter(query_grads.values())).device
+    )
     for name, seq_grads in seq_collector.gradients.items():
         seq_scores += (seq_grads.float() * query_grads[name]).sum(dim=-1)
 
