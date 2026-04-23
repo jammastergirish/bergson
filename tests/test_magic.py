@@ -240,6 +240,134 @@ def test_magic_per_token_sums_to_per_doc_packed(model_name):
     torch.testing.assert_close(agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4)
 
 
+def _run_magic_with_pad(
+    model_name, dataset, num_docs, batch_size, per_token, seed=42, device="cpu"
+):
+    """Like _run_magic but goes through pad_dataset_to_batch_size and mirrors
+    worker()'s pad-zero writes and scores-trim. Returns `scores` in the shape
+    worker() saves to scores.pt: (num_docs,) for per-doc, (num_chunks, T) for
+    per-token.
+    """
+    from bergson.magic.cli import pad_dataset_to_batch_size
+
+    padded_ds, num_docs_pad, pad_count, weight_pad_count = pad_dataset_to_batch_size(
+        dataset, batch_size, num_docs, "Test", 0
+    )
+
+    if per_token:
+        T = len(padded_ds[0]["input_ids"])
+        weight_shape = (len(padded_ds), T)
+    else:
+        weight_shape = (num_docs_pad,)
+
+    torch.manual_seed(seed)
+    config = AutoConfig.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_config(
+        config, torch_dtype=torch.float32, attn_implementation="eager"
+    )
+    model.loss_function = weighted_causal_lm_ce
+    model.requires_grad_(True)
+
+    optimizer = torchopt.adamw(1e-4, betas=(0.95, 0.975), eps_root=1e-2)
+    trainer, fwd_state = Trainer.initialize(model, optimizer)
+    stream = DataStream(
+        padded_ds, batch_size=batch_size, device=device, weight_shape=weight_shape
+    )
+
+    if pad_count:
+        if stream.weights.ndim == 1:
+            stream.weights.data[-weight_pad_count:] = 0.0
+        else:
+            stream.weights.data[-pad_count:] = 0.0
+
+    with tempfile.TemporaryDirectory() as ckpt_dir:
+        fwd_state = trainer.train(
+            fwd_state, stream, inplace=True, save_dir=ckpt_dir
+        )
+        with fwd_state.activate(model) as params:
+            batch = stream[0]
+            del batch["example_weight"]
+            loss = model(**batch).loss
+            query_grads = {
+                k: g.detach().clone() for k, g in grad_tree(loss, params).items()
+            }
+            opt_grads = [
+                torch.zeros_like(buf)
+                for buf in tree_iter(fwd_state.opt_state)
+                if isinstance(buf, torch.Tensor) and buf.is_floating_point()
+            ]
+            bwd_state = BackwardState(
+                query_grads, opt_grads, torch.zeros_like(stream.weights)
+            )
+        stream.requires_grad = True
+        bwd_state = trainer.backward(
+            ckpt_dir, stream, bwd_state, fwd_state, inplace=True, cleanup=True
+        )
+
+    scores = bwd_state.weight_grads.detach().cpu()
+    if pad_count:
+        if scores.ndim == 1:
+            scores = scores[:-weight_pad_count]
+        else:
+            scores = scores[:-pad_count]
+    return scores
+
+
+@pytest.mark.parametrize("model_name", MODEL_CONFIGS)
+def test_magic_per_token_sums_to_per_doc_with_padding(model_name):
+    """Per-token MAGIC scores scatter-summed by doc_ids equal per-doc MAGIC
+    scores even when the chunked dataset isn't divisible by batch_size —
+    exercising the pad_dataset_to_batch_size path plus worker()'s pad-zero
+    writes.
+
+    Regression: a naive `stream.weights.data[-pad_count:] = 0.0` silences real
+    docs in the per-doc (1D, doc_ids-indexed) case, because pad rows inherit
+    the last chunk's doc_ids via `dataset.select`. Pad rows must be routed to
+    a synthetic doc id so only they are silenced.
+    """
+    from datasets import Dataset
+
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [
+                [1, 2, 3, 4, 5],
+                [6, 7, 8, 9, 10],
+                [11, 12, 13, 14, 15],
+            ],
+            "labels": [
+                [1, 2, 3, 4, 5],
+                [6, 7, 8, 9, 10],
+                [11, 12, 13, 14, 15],
+            ],
+            "attention_mask": [[1] * 5] * 3,
+            # 3 chunks, each a distinct doc; 3 % batch_size(=2) == 1 → pad 1
+            "doc_ids": [[0] * 5, [1] * 5, [2] * 5],
+        }
+    )
+    num_real_docs = 3
+    T = 5
+    batch_size = 2
+
+    per_doc = _run_magic_with_pad(
+        model_name, ds, num_real_docs, batch_size, per_token=False
+    )
+    per_tok = _run_magic_with_pad(
+        model_name, ds, num_real_docs, batch_size, per_token=True
+    )
+
+    assert per_doc.shape == (num_real_docs,), f"per_doc shape {per_doc.shape}"
+    assert per_tok.shape == (num_real_docs, T), f"per_tok shape {per_tok.shape}"
+
+    flat_doc_ids = torch.tensor(ds["doc_ids"]).reshape(-1)
+    agg = torch.zeros(num_real_docs, dtype=torch.float64)
+    agg.scatter_add_(0, flat_doc_ids, per_tok.reshape(-1).to(torch.float64))
+
+    assert (agg.abs() > 0).all(), f"Some doc has zero aggregated score: {agg}"
+    torch.testing.assert_close(
+        agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4
+    )
+
+
 def test_magic_resume(dataset):
     """Resume from a checkpoint mid-training and verify identical final state."""
     device = "cpu"

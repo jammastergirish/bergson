@@ -175,31 +175,57 @@ def pad_dataset_to_batch_size(
     num_docs: int,
     label: str,
     global_rank: int,
-) -> tuple[Dataset, int, int]:
+) -> tuple[Dataset, int, int, int]:
     """Pad dataset to be divisible by batch_size by repeating the last example.
 
-    Returns (padded_dataset, num_docs, pad_count). num_docs is updated only when
-    the dataset has no "doc_ids" column (i.e. each row is its own document).
-    pad_count is 0 if no padding was needed.
+    Returns (padded_dataset, num_docs, pad_count, weight_pad_count).
+
+    `pad_count` is the number of rows appended to the dataset (0 if unchanged).
+    `weight_pad_count` is the number of trailing entries of a *1D* per-doc
+    weight tensor that should be zeroed to silence the pad rows' training
+    contribution.
+
+    - If the dataset has a "doc_ids" column, `.select(total - 1, ...)` copies
+      the last doc's doc_ids into every pad row. Zeroing the last `pad_count`
+      entries of a weights-indexed-by-doc_id tensor would silence real docs,
+      so we instead route pad rows to a fresh synthetic doc id (=num_docs),
+      bump num_docs by 1, and set `weight_pad_count = 1`.
+    - Otherwise rows are self-identified docs: num_docs becomes the padded
+      length and `weight_pad_count = pad_count` zeros the pad rows directly.
+
+    In per-token (2D) mode callers should zero `weights[-pad_count:]` instead
+    — `weight_pad_count` applies only to 1D per-doc weights.
     """
     remainder = len(dataset) % batch_size
     if not remainder:
-        return dataset, num_docs, 0
+        return dataset, num_docs, 0, 0
 
     pad_count = batch_size - remainder
     total = len(dataset)
     pad_indices = list(range(total)) + [total - 1] * pad_count
     dataset = dataset.select(pad_indices)
 
-    # Update the number of documents to include the padded examples
-    if "doc_ids" not in dataset.column_names:
+    if "doc_ids" in dataset.column_names:
+        synthetic_doc_id = num_docs
+        new_doc_ids = [
+            row if i < total else [synthetic_doc_id] * len(row)
+            for i, row in enumerate(dataset["doc_ids"])
+        ]
+        dataset = dataset.remove_columns("doc_ids").add_column(
+            "doc_ids", new_doc_ids
+        )
+        num_docs += 1
+        weight_pad_count = 1
+    else:
         num_docs = len(dataset)
+        weight_pad_count = pad_count
+
     if global_rank == 0:
         print(
             f"{label}: padded {pad_count}/{total} examples "
             f"(weight=0) to fill last batch"
         )
-    return dataset, num_docs, pad_count
+    return dataset, num_docs, pad_count, weight_pad_count
 
 
 def worker(
@@ -233,8 +259,10 @@ def worker(
     assert run_cfg.batch_size % world_size == 0
 
     # Pad train dataset to be divisible by batch_size (weight=0 for padding)
-    train_dataset, num_train_docs, pad_count = pad_dataset_to_batch_size(
-        train_dataset, run_cfg.batch_size, num_train_docs, "Train", global_rank
+    train_dataset, num_train_docs, pad_count, weight_pad_count = (
+        pad_dataset_to_batch_size(
+            train_dataset, run_cfg.batch_size, num_train_docs, "Train", global_rank
+        )
     )
 
     if run_cfg.per_token:
@@ -255,7 +283,10 @@ def worker(
         weight_shape=w_shape,
     )
     if pad_count:
-        stream.weights.data[-pad_count:] = 0.0
+        if stream.weights.ndim == 1:
+            stream.weights.data[-weight_pad_count:] = 0.0
+        else:
+            stream.weights.data[-pad_count:] = 0.0
 
     log_fn = None
     if run_cfg.wandb_project and global_rank == 0:
@@ -293,8 +324,10 @@ def worker(
         save_fut.result()  # ensure state0 is saved before validation loads it
 
     # Pad query dataset to be divisible by batch_size (weight=0 for padding)
-    query_dataset, num_query_docs, query_pad_count = pad_dataset_to_batch_size(
-        query_dataset, run_cfg.batch_size, num_query_docs, "Query", global_rank
+    query_dataset, num_query_docs, query_pad_count, query_weight_pad_count = (
+        pad_dataset_to_batch_size(
+            query_dataset, run_cfg.batch_size, num_query_docs, "Query", global_rank
+        )
     )
     if len(query_dataset) < run_cfg.batch_size:
         raise ValueError(
@@ -312,7 +345,8 @@ def worker(
         weight_shape=(num_query_docs,),
     )
     if query_pad_count:
-        query_stream.weights.data[-query_pad_count:] = 0.0
+        # query_stream.weights is always 1D (weight_shape=(num_query_docs,))
+        query_stream.weights.data[-query_weight_pad_count:] = 0.0
 
     query_grads, baseline = compute_query_gradients(
         fwd_state, model, query_stream, run_cfg.query_method, run_cfg.fsdp
@@ -343,7 +377,10 @@ def worker(
 
     scores = bwd_state.weight_grads.cpu()
     if pad_count:
-        scores = scores[:-pad_count]
+        if scores.ndim == 1:
+            scores = scores[:-weight_pad_count]
+        else:
+            scores = scores[:-pad_count]
     if global_rank == 0:
         print(f"Baseline loss: {baseline}")
 
@@ -391,7 +428,10 @@ def worker(
 
         stream.weights.fill_(1.0)
         if pad_count:
-            stream.weights.data[-pad_count:] = 0.0
+            if stream.weights.ndim == 1:
+                stream.weights.data[-weight_pad_count:] = 0.0
+            else:
+                stream.weights.data[-pad_count:] = 0.0
         stream.weights[subset] = 0.0
 
         for x in stream:
