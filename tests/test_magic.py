@@ -140,6 +140,44 @@ def _run_magic(model_name, dataset, weight_shape, seed=42, device="cpu"):
 
 
 @pytest.mark.parametrize("model_name", MODEL_CONFIGS)
+def test_magic_per_token_scores_zero_at_masked_labels(model_name):
+    """MAGIC scores are exactly zero at positions whose weight has no loss path.
+
+    Two sources of zero-by-construction in weighted_causal_lm_ce:
+    - shifted labels == -100: F.cross_entropy with ignore_index=-100 makes
+      tok_loss[t] == 0, so w[:, t] enters the loss multiplied by zero.
+    - the last-token weight slot: example_weight is sliced as [:, :-1] before
+      multiplication, so column T-1 never enters the loss.
+    """
+    from datasets import Dataset
+
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]],
+            "labels": [[1, 2, -100, 4, 5], [-100, 7, 8, -100, 10]],
+            "attention_mask": [[1, 1, 1, 1, 1], [1, 1, 1, 1, 1]],
+        }
+    )
+    N, T = len(ds), 5
+
+    per_tok = _run_magic(model_name, ds, weight_shape=(N, T))
+    assert per_tok.shape == (N, T)
+
+    labels = torch.tensor(ds["labels"])
+    zero_mask = torch.zeros(N, T, dtype=torch.bool)
+    zero_mask[:, T - 1] = True  # unused last-token slot
+    zero_mask[:, :-1] = labels[:, 1:] == -100  # shifted masked positions
+
+    assert torch.all(per_tok[zero_mask] == 0), (
+        f"Expected zero MAGIC scores at masked/unused positions; "
+        f"got max |score| = {per_tok[zero_mask].abs().max():.3e}"
+    )
+    assert per_tok[~zero_mask].abs().sum() > 0, (
+        "All non-masked positions are zero — test is degenerate"
+    )
+
+
+@pytest.mark.parametrize("model_name", MODEL_CONFIGS)
 def test_magic_per_token_sums_to_per_doc(model_name, dataset):
     """Per-token MAGIC scores summed over tokens equal per-doc MAGIC scores.
 
@@ -161,6 +199,47 @@ def test_magic_per_token_sums_to_per_doc(model_name, dataset):
     assert per_tok.shape == (N, T)
 
     torch.testing.assert_close(per_tok.sum(dim=-1), per_doc, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("model_name", MODEL_CONFIGS)
+def test_magic_per_token_sums_to_per_doc_packed(model_name):
+    """Per-doc MAGIC (1D weights via doc_ids lookup) equals per-token MAGIC
+    scatter-summed by doc_ids, with document packing across chunks.
+
+    Exercises the non-trivial path used by the empirical per-token/per-doc
+    comparison: chunks contain multiple documents, one document spans two
+    chunks, and the per-doc weight is shared across all positions of that
+    doc. Mirrors the scatter_add(doc_ids) aggregation in
+    scripts/correlate_pertoken_vs_docrun.py.
+    """
+    from datasets import Dataset
+
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]],
+            "labels": [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]],
+            "attention_mask": [[1] * 6, [1] * 6],
+            # Packed: 4 unique docs across 2 chunks; doc 2 spans both chunks.
+            "doc_ids": [[0, 0, 1, 1, 1, 2], [2, 2, 2, 3, 3, 3]],
+        }
+    )
+    N, T, num_docs = len(ds), 6, 4
+
+    per_doc = _run_magic(model_name, ds, weight_shape=(num_docs,))
+    per_tok = _run_magic(model_name, ds, weight_shape=(N, T))
+
+    assert per_doc.shape == (num_docs,)
+    assert per_tok.shape == (N, T)
+
+    flat_doc_ids = torch.tensor(ds["doc_ids"]).reshape(-1)
+    agg = torch.zeros(num_docs, dtype=torch.float64)
+    agg.scatter_add_(0, flat_doc_ids, per_tok.reshape(-1).to(torch.float64))
+
+    # Every doc should receive at least one nonzero token contribution.
+    assert (agg.abs() > 0).all(), f"Some doc has zero aggregated score: {agg}"
+    torch.testing.assert_close(
+        agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4
+    )
 
 
 def test_magic_resume(dataset):
