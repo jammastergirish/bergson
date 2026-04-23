@@ -281,9 +281,7 @@ def _run_magic_with_pad(
             stream.weights.data[-pad_count:] = 0.0
 
     with tempfile.TemporaryDirectory() as ckpt_dir:
-        fwd_state = trainer.train(
-            fwd_state, stream, inplace=True, save_dir=ckpt_dir
-        )
+        fwd_state = trainer.train(fwd_state, stream, inplace=True, save_dir=ckpt_dir)
         with fwd_state.activate(model) as params:
             batch = stream[0]
             del batch["example_weight"]
@@ -363,9 +361,7 @@ def test_magic_per_token_sums_to_per_doc_with_padding(model_name):
     agg.scatter_add_(0, flat_doc_ids, per_tok.reshape(-1).to(torch.float64))
 
     assert (agg.abs() > 0).all(), f"Some doc has zero aggregated score: {agg}"
-    torch.testing.assert_close(
-        agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4
-    )
+    torch.testing.assert_close(agg, per_doc.to(torch.float64), atol=1e-5, rtol=1e-4)
 
 
 def test_magic_resume(dataset):

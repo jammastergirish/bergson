@@ -211,9 +211,7 @@ def pad_dataset_to_batch_size(
             row if i < total else [synthetic_doc_id] * len(row)
             for i, row in enumerate(dataset["doc_ids"])
         ]
-        dataset = dataset.remove_columns("doc_ids").add_column(
-            "doc_ids", new_doc_ids
-        )
+        dataset = dataset.remove_columns("doc_ids").add_column("doc_ids", new_doc_ids)
         num_docs += 1
         weight_pad_count = 1
     else:
