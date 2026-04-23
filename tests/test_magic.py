@@ -160,9 +160,7 @@ def test_magic_per_token_sums_to_per_doc(model_name, dataset):
     assert per_doc.shape == (N,)
     assert per_tok.shape == (N, T)
 
-    torch.testing.assert_close(
-        per_tok.sum(dim=-1), per_doc, atol=1e-5, rtol=1e-4
-    )
+    torch.testing.assert_close(per_tok.sum(dim=-1), per_doc, atol=1e-5, rtol=1e-4)
 
 
 def test_magic_resume(dataset):
